@@ -103,17 +103,17 @@ func mustAuth(t *testing.T, baseURL string) string {
 	}
 	if resp.StatusCode != http.StatusOK {
 		b, _ := io.ReadAll(resp.Body)
-		resp.Body.Close()
+		_ = resp.Body.Close()
 		t.Fatalf("POST /auth status = %d: %s", resp.StatusCode, b)
 	}
 	var ar struct {
 		AuthURL string `json:"auth_url"`
 	}
 	if err := json.NewDecoder(resp.Body).Decode(&ar); err != nil {
-		resp.Body.Close()
+		_ = resp.Body.Close()
 		t.Fatalf("decode POST /auth body: %v", err)
 	}
-	resp.Body.Close()
+	_ = resp.Body.Close()
 
 	u, err := url.Parse(ar.AuthURL)
 	if err != nil {
@@ -131,17 +131,17 @@ func mustAuth(t *testing.T, baseURL string) string {
 	}
 	if resp2.StatusCode != http.StatusOK {
 		b, _ := io.ReadAll(resp2.Body)
-		resp2.Body.Close()
+		_ = resp2.Body.Close()
 		t.Fatalf("GET /auth/callback status = %d: %s", resp2.StatusCode, b)
 	}
 	var cr struct {
 		Token string `json:"token"`
 	}
 	if err := json.NewDecoder(resp2.Body).Decode(&cr); err != nil {
-		resp2.Body.Close()
+		_ = resp2.Body.Close()
 		t.Fatalf("decode /auth/callback body: %v", err)
 	}
-	resp2.Body.Close()
+	_ = resp2.Body.Close()
 	if cr.Token == "" {
 		t.Fatal("callback response has empty token")
 	}
@@ -168,14 +168,14 @@ func assertStatus(t *testing.T, resp *http.Response, want int) {
 	t.Helper()
 	if resp.StatusCode != want {
 		b, _ := io.ReadAll(resp.Body)
-		resp.Body.Close()
+		_ = resp.Body.Close()
 		t.Fatalf("status = %d, want %d — body: %s", resp.StatusCode, want, b)
 	}
 }
 
 func decodeJSON(t *testing.T, resp *http.Response, v any) {
 	t.Helper()
-	defer resp.Body.Close()
+	defer func() { _ = resp.Body.Close() }()
 	if err := json.NewDecoder(resp.Body).Decode(v); err != nil {
 		t.Fatalf("decode JSON: %v", err)
 	}
@@ -222,8 +222,7 @@ func TestAuthCallback_ReturnsToken(t *testing.T) {
 
 	resp, _ := http.Post(env.ts.URL+"/auth", "application/json", bytes.NewReader([]byte("{}")))
 	var ar struct{ AuthURL string `json:"auth_url"` }
-	json.NewDecoder(resp.Body).Decode(&ar)
-	resp.Body.Close()
+	decodeJSON(t, resp, &ar)
 
 	u, _ := url.Parse(ar.AuthURL)
 	state := u.Query().Get("state")
@@ -241,7 +240,7 @@ func TestAuthCallback_ReturnsToken(t *testing.T) {
 func TestAuthCallback_UnknownState(t *testing.T) {
 	env := newTestEnv(t)
 	resp := getWithToken(t, env.ts.URL+"/auth/callback?code=x&state=doesnotexist", "")
-	defer resp.Body.Close()
+	defer func() { _ = resp.Body.Close() }()
 	assertStatus(t, resp, http.StatusBadRequest)
 }
 
@@ -250,8 +249,7 @@ func TestAuthCallback_StateConsumedOnUse(t *testing.T) {
 
 	resp, _ := http.Post(env.ts.URL+"/auth", "application/json", bytes.NewReader([]byte("{}")))
 	var ar struct{ AuthURL string `json:"auth_url"` }
-	json.NewDecoder(resp.Body).Decode(&ar)
-	resp.Body.Close()
+	decodeJSON(t, resp, &ar)
 
 	u, _ := url.Parse(ar.AuthURL)
 	state := u.Query().Get("state")
@@ -260,12 +258,12 @@ func TestAuthCallback_StateConsumedOnUse(t *testing.T) {
 	// First use: should succeed.
 	r1 := getWithToken(t, cbURL, "")
 	assertStatus(t, r1, http.StatusOK)
-	io.ReadAll(r1.Body)
-	r1.Body.Close()
+	_, _ = io.Copy(io.Discard, r1.Body)
+	_ = r1.Body.Close()
 
 	// Second use of same state: must fail.
 	r2 := getWithToken(t, cbURL, "")
-	defer r2.Body.Close()
+	defer func() { _ = r2.Body.Close() }()
 	assertStatus(t, r2, http.StatusBadRequest)
 }
 
@@ -298,7 +296,7 @@ func TestListCalendars(t *testing.T) {
 func TestListCalendars_MissingToken(t *testing.T) {
 	env := newTestEnv(t)
 	resp := getWithToken(t, env.ts.URL+"/calendars", "")
-	defer resp.Body.Close()
+	defer func() { _ = resp.Body.Close() }()
 	// huma returns 400 for missing required header, or our 401 — either is correct
 	if resp.StatusCode == http.StatusOK {
 		t.Fatal("expected non-200 for missing token")
@@ -308,7 +306,7 @@ func TestListCalendars_MissingToken(t *testing.T) {
 func TestListCalendars_InvalidToken(t *testing.T) {
 	env := newTestEnv(t)
 	resp := getWithToken(t, env.ts.URL+"/calendars", "this-is-not-a-valid-token")
-	defer resp.Body.Close()
+	defer func() { _ = resp.Body.Close() }()
 	assertStatus(t, resp, http.StatusUnauthorized)
 }
 
@@ -318,7 +316,7 @@ func TestListCalendars_ProviderError(t *testing.T) {
 	tok := mustAuth(t, env.ts.URL)
 
 	resp := getWithToken(t, env.ts.URL+"/calendars", tok)
-	defer resp.Body.Close()
+	defer func() { _ = resp.Body.Close() }()
 	assertStatus(t, resp, http.StatusBadGateway)
 }
 
@@ -372,7 +370,7 @@ func TestListEvents_InvalidStart(t *testing.T) {
 	env := newTestEnv(t)
 	tok := mustAuth(t, env.ts.URL)
 	resp := getWithToken(t, env.ts.URL+"/calendars/cal-1/events?start=not-a-date", tok)
-	defer resp.Body.Close()
+	defer func() { _ = resp.Body.Close() }()
 	assertStatus(t, resp, http.StatusUnprocessableEntity)
 }
 
@@ -380,7 +378,7 @@ func TestListEvents_InvalidEnd(t *testing.T) {
 	env := newTestEnv(t)
 	tok := mustAuth(t, env.ts.URL)
 	resp := getWithToken(t, env.ts.URL+"/calendars/cal-1/events?end=garbage", tok)
-	defer resp.Body.Close()
+	defer func() { _ = resp.Body.Close() }()
 	assertStatus(t, resp, http.StatusUnprocessableEntity)
 }
 
@@ -408,7 +406,7 @@ func TestGetEvent_NotFound(t *testing.T) {
 	env.gw.err = calgate.ErrNotFound
 	tok := mustAuth(t, env.ts.URL)
 	resp := getWithToken(t, env.ts.URL+"/calendars/cal-1/events/missing", tok)
-	defer resp.Body.Close()
+	defer func() { _ = resp.Body.Close() }()
 	assertStatus(t, resp, http.StatusNotFound)
 }
 
@@ -417,7 +415,7 @@ func TestGetEvent_RateLimited(t *testing.T) {
 	env.gw.err = calgate.ErrRateLimited
 	tok := mustAuth(t, env.ts.URL)
 	resp := getWithToken(t, env.ts.URL+"/calendars/cal-1/events/ev-1", tok)
-	defer resp.Body.Close()
+	defer func() { _ = resp.Body.Close() }()
 	assertStatus(t, resp, http.StatusTooManyRequests)
 }
 
@@ -431,7 +429,7 @@ func TestResponseContentType(t *testing.T) {
 	resp := getWithToken(t, env.ts.URL+"/calendars", tok)
 	assertStatus(t, resp, http.StatusOK)
 	ct := resp.Header.Get("Content-Type")
-	resp.Body.Close()
+	_ = resp.Body.Close()
 	if ct == "" {
 		t.Error("missing Content-Type header")
 	}
