@@ -67,6 +67,9 @@ func New(cfg Config) *Server {
 	return s
 }
 
+// Handler returns the underlying http.Handler, useful for embedding or testing.
+func (s *Server) Handler() http.Handler { return s.router }
+
 // Run starts the HTTP server and blocks until ctx is cancelled or a fatal
 // error occurs. Returns http.ErrServerClosed on clean shutdown.
 func (s *Server) Run(ctx context.Context) error {
