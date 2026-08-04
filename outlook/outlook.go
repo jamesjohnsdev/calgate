@@ -100,6 +100,13 @@ func (c *Client) SourceFor(ctx context.Context, userID string, store calgate.Tok
 	return calgate.PersistingSource(ctx, userID, base, tok, store), nil
 }
 
+// TokenSource creates an auto-refreshing token source for an existing token.
+// Use this when the caller holds the token (stateless server mode) rather than
+// looking it up from a store.
+func (c *Client) TokenSource(ctx context.Context, tok *oauth2.Token) oauth2.TokenSource {
+	return c.oauth.TokenSource(ctx, tok)
+}
+
 type gateway struct {
 	http *http.Client
 	base string // Graph base URL; overridable in tests
