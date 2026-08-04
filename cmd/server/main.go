@@ -1,11 +1,12 @@
 // Command server runs calgate as a stateless HTTP microservice.
 // Configure via environment variables:
 //
-//	CALGATE_CLIENT_ID      Azure AD app client ID            (required)
-//	CALGATE_CLIENT_SECRET  Azure AD app client secret        (required)
-//	CALGATE_REDIRECT_URL   OAuth redirect URL                (required)
-//	CALGATE_TENANT         Azure AD tenant, default "common"  (optional)
-//	CALGATE_ADDR           Listen address, default ":8080"   (optional)
+//	CALGATE_PROVIDER       Calendar provider: "outlook" (default) or "google"
+//	CALGATE_CLIENT_ID      OAuth app client ID                      (required)
+//	CALGATE_CLIENT_SECRET  OAuth app client secret                  (required)
+//	CALGATE_REDIRECT_URL   OAuth redirect URL                       (required)
+//	CALGATE_TENANT         Azure AD tenant, default "common"        (outlook only)
+//	CALGATE_ADDR           Listen address, default ":8080"          (optional)
 //
 // Tokens are caller-managed. POST /auth starts the flow; GET /auth/callback
 // returns an encoded token the caller stores. Send it as X-Calgate-Token on
@@ -26,33 +27,55 @@ import (
 	"golang.org/x/oauth2"
 
 	"github.com/jamesjohnsdev/calgate"
+	"github.com/jamesjohnsdev/calgate/google"
 	"github.com/jamesjohnsdev/calgate/outlook"
 	"github.com/jamesjohnsdev/calgate/server"
 )
 
 func main() {
+	provider := os.Getenv("CALGATE_PROVIDER")
+	if provider == "" {
+		provider = "outlook"
+	}
+
 	clientID := mustEnv("CALGATE_CLIENT_ID")
 	clientSecret := mustEnv("CALGATE_CLIENT_SECRET")
 	redirectURL := mustEnv("CALGATE_REDIRECT_URL")
-
-	tenant := os.Getenv("CALGATE_TENANT")
 	addr := os.Getenv("CALGATE_ADDR")
 
-	client := outlook.New(outlook.Config{
-		ClientID:     clientID,
-		ClientSecret: clientSecret,
-		RedirectURL:  redirectURL,
-		Tenant:       tenant,
-	})
+	var cfg server.Config
+	cfg.Addr = addr
 
-	srv := server.New(server.Config{
-		Addr:           addr,
-		Authenticator:  client,
-		NewTokenSource: client.TokenSource,
-		NewGateway: func(ctx context.Context, ts oauth2.TokenSource) calgate.Gateway {
+	switch provider {
+	case "google":
+		client := google.New(google.Config{
+			ClientID:     clientID,
+			ClientSecret: clientSecret,
+			RedirectURL:  redirectURL,
+		})
+		cfg.Authenticator = client
+		cfg.NewTokenSource = client.TokenSource
+		cfg.NewGateway = func(ctx context.Context, ts oauth2.TokenSource) calgate.Gateway {
 			return client.Gateway(ctx, ts)
-		},
-	})
+		}
+	case "outlook":
+		tenant := os.Getenv("CALGATE_TENANT")
+		client := outlook.New(outlook.Config{
+			ClientID:     clientID,
+			ClientSecret: clientSecret,
+			RedirectURL:  redirectURL,
+			Tenant:       tenant,
+		})
+		cfg.Authenticator = client
+		cfg.NewTokenSource = client.TokenSource
+		cfg.NewGateway = func(ctx context.Context, ts oauth2.TokenSource) calgate.Gateway {
+			return client.Gateway(ctx, ts)
+		}
+	default:
+		log.Fatalf("unknown CALGATE_PROVIDER %q; must be outlook or google", provider)
+	}
+
+	srv := server.New(cfg)
 
 	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
 	defer stop()
