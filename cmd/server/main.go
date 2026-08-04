@@ -1,14 +1,16 @@
-// Command server runs calgate as an HTTP microservice.
-// Graph. Configure via environment variables:
+// Command server runs calgate as a stateless HTTP microservice.
+// Configure via environment variables:
 //
-//	CALGATE_CLIENT_ID      Azure AD app client ID           (required)
-//	CALGATE_CLIENT_SECRET  Azure AD app client secret       (required)
-//	CALGATE_REDIRECT_URL   OAuth redirect URL               (required)
-//	CALGATE_TENANT         Azure AD tenant, default "common" (optional)
-//	CALGATE_ADDR           Listen address, default ":8080"  (optional)
+//	CALGATE_CLIENT_ID      Azure AD app client ID            (required)
+//	CALGATE_CLIENT_SECRET  Azure AD app client secret        (required)
+//	CALGATE_REDIRECT_URL   OAuth redirect URL                (required)
+//	CALGATE_TENANT         Azure AD tenant, default "common"  (optional)
+//	CALGATE_ADDR           Listen address, default ":8080"   (optional)
 //
-// Token storage is in-memory only. For production replace calgate.NewMemoryStore
-// with a durable, encrypted implementation.
+// Tokens are caller-managed. POST /auth starts the flow; GET /auth/callback
+// returns an encoded token the caller stores. Send it as X-Calgate-Token on
+// every subsequent request. If the token is refreshed mid-request, the updated
+// token is returned in the same header.
 package main
 
 import (
@@ -20,6 +22,8 @@ import (
 	"os"
 	"os/signal"
 	"syscall"
+
+	"golang.org/x/oauth2"
 
 	"github.com/jamesjohnsdev/calgate"
 	"github.com/jamesjohnsdev/calgate/outlook"
@@ -40,18 +44,13 @@ func main() {
 		RedirectURL:  redirectURL,
 		Tenant:       tenant,
 	})
-	store := calgate.NewMemoryStore()
 
 	srv := server.New(server.Config{
-		Addr:          addr,
-		Authenticator: client,
-		Store:         store,
-		NewGateway: func(ctx context.Context, userID string) (calgate.Gateway, error) {
-			src, err := client.SourceFor(ctx, userID, store)
-			if err != nil {
-				return nil, err
-			}
-			return client.Gateway(ctx, src), nil
+		Addr:           addr,
+		Authenticator:  client,
+		NewTokenSource: client.TokenSource,
+		NewGateway: func(ctx context.Context, ts oauth2.TokenSource) calgate.Gateway {
+			return client.Gateway(ctx, ts)
 		},
 	})
 

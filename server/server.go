@@ -1,12 +1,17 @@
-// Package server wraps calgate as a lightweight HTTP microservice using chi
-// and huma. It exposes the auth flow and read endpoints over a REST/JSON API
-// and generates an OpenAPI spec automatically.
+// Package server wraps calgate as a lightweight stateless HTTP microservice
+// using chi and huma. Tokens are caller-managed: the auth callback returns an
+// encoded token that the caller stores and sends with every subsequent request
+// via the X-Calgate-Token header. If the provider refreshes the token during a
+// request, the updated token is echoed in the same response header so the
+// caller can update their stored copy.
 package server
 
 import (
 	"context"
 	"crypto/rand"
+	"encoding/base64"
 	"encoding/hex"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"net/http"
@@ -17,30 +22,35 @@ import (
 	"github.com/danielgtaylor/huma/v2/adapters/humachi"
 	"github.com/go-chi/chi/v5"
 	"github.com/go-chi/chi/v5/middleware"
+	"golang.org/x/oauth2"
+
 	"github.com/jamesjohnsdev/calgate"
 )
-
-// GatewayFactory builds a Gateway for the given user from their stored token.
-// Returns calgate.ErrUnauthorized when the user has not yet authorized.
-type GatewayFactory func(ctx context.Context, userID string) (calgate.Gateway, error)
 
 // Config holds everything the server needs at construction time.
 type Config struct {
 	// Addr is the TCP address to listen on. Defaults to ":8080".
-	Addr          string
+	Addr string
+
 	Authenticator calgate.Authenticator
-	Store         calgate.TokenStore
-	NewGateway    GatewayFactory
+
+	// NewTokenSource wraps a raw token in an auto-refreshing oauth2.TokenSource.
+	// Needed so the server can transparently refresh expired access tokens during
+	// a request without requiring the caller to re-authorize.
+	NewTokenSource func(ctx context.Context, tok *oauth2.Token) oauth2.TokenSource
+
+	// NewGateway creates a provider Gateway backed by the given TokenSource.
+	NewGateway func(ctx context.Context, ts oauth2.TokenSource) calgate.Gateway
 }
 
-// Server is the HTTP microservice gateway over calgate.
+// Server is the stateless HTTP microservice gateway over calgate.
 type Server struct {
 	cfg    Config
 	router *chi.Mux
 	api    huma.API
 
 	mu      sync.Mutex
-	pending map[string]string // state token → userID
+	pending map[string]struct{} // valid CSRF state tokens; cleared on callback
 }
 
 // New builds and wires the server. Call Run to start listening.
@@ -61,7 +71,7 @@ func New(cfg Config) *Server {
 		cfg:     cfg,
 		router:  r,
 		api:     api,
-		pending: map[string]string{},
+		pending: map[string]struct{}{},
 	}
 	s.register()
 	return s
@@ -86,30 +96,77 @@ func (s *Server) Run(ctx context.Context) error {
 	return srv.ListenAndServe()
 }
 
+// tokenCapture is a per-request calgate.TokenStore whose only job is to catch
+// any token that PersistingSource saves after a refresh. Load is never called
+// by PersistingSource (it uses the seed directly); only Save is used.
+type tokenCapture struct {
+	mu     sync.Mutex
+	latest *oauth2.Token
+}
+
+func (tc *tokenCapture) Load(_ context.Context, _ string) (*oauth2.Token, error) {
+	return nil, calgate.ErrUnauthorized
+}
+
+func (tc *tokenCapture) Save(_ context.Context, _ string, t *oauth2.Token) error {
+	tc.mu.Lock()
+	tc.latest = t
+	tc.mu.Unlock()
+	return nil
+}
+
+// buildGateway decodes the token from the request header, wraps it in a
+// PersistingSource so any mid-request refresh is captured, and returns the
+// Gateway and the capture. Callers check capture after the request to know
+// whether to echo an updated token to the caller.
+func (s *Server) buildGateway(ctx context.Context, encoded string) (calgate.Gateway, *tokenCapture, error) {
+	tok, err := decodeToken(encoded)
+	if err != nil {
+		return nil, nil, huma.NewError(http.StatusUnauthorized, "invalid or missing token; run POST /auth")
+	}
+	capture := &tokenCapture{}
+	base := s.cfg.NewTokenSource(ctx, tok)
+	src := calgate.PersistingSource(ctx, "req", base, tok, capture)
+	return s.cfg.NewGateway(ctx, src), capture, nil
+}
+
+// capturedToken returns the base64-encoded refreshed token if PersistingSource
+// saved a new one, or an empty string (no header to set) if not.
+func capturedToken(c *tokenCapture) string {
+	c.mu.Lock()
+	tok := c.latest
+	c.mu.Unlock()
+	if tok == nil {
+		return ""
+	}
+	enc, err := encodeToken(tok)
+	if err != nil {
+		return ""
+	}
+	return enc
+}
+
 func (s *Server) register() {
 	// ── Auth ─────────────────────────────────────────────────────────────────
 
-	type beginAuthBody struct {
-		UserID string `json:"user_id" doc:"Unique identifier for the account being authorized."`
-	}
 	type beginAuthOut struct {
 		Body struct {
-			AuthURL string `json:"auth_url" doc:"Open this URL in a browser to complete authorization."`
+			AuthURL string `json:"auth_url" doc:"Open in a browser to authorize the account."`
 		}
 	}
 	huma.Register(s.api, huma.Operation{
 		OperationID: "begin-auth",
 		Method:      http.MethodPost,
 		Path:        "/auth",
-		Summary:     "Start the OAuth authorization flow for a user",
+		Summary:     "Start the OAuth authorization flow",
 		Tags:        []string{"auth"},
-	}, func(ctx context.Context, in *struct{ Body beginAuthBody }) (*beginAuthOut, error) {
+	}, func(ctx context.Context, _ *struct{}) (*beginAuthOut, error) {
 		state, err := randomState()
 		if err != nil {
-			return nil, huma.NewError(http.StatusInternalServerError, "failed to generate state token")
+			return nil, huma.NewError(http.StatusInternalServerError, "failed to generate state")
 		}
 		s.mu.Lock()
-		s.pending[state] = in.Body.UserID
+		s.pending[state] = struct{}{}
 		s.mu.Unlock()
 
 		out := &beginAuthOut{}
@@ -117,19 +174,23 @@ func (s *Server) register() {
 		return out, nil
 	})
 
+	type callbackOut struct {
+		Body struct {
+			Token string `json:"token" doc:"Base64-encoded OAuth token. Store and send as X-Calgate-Token on subsequent requests. Treat as opaque — refresh token is embedded."`
+		}
+	}
 	huma.Register(s.api, huma.Operation{
-		OperationID:   "auth-callback",
-		Method:        http.MethodGet,
-		Path:          "/auth/callback",
-		Summary:       "OAuth redirect target — exchanges auth code for token",
-		Tags:          []string{"auth"},
-		DefaultStatus: http.StatusNoContent,
+		OperationID: "auth-callback",
+		Method:      http.MethodGet,
+		Path:        "/auth/callback",
+		Summary:     "OAuth redirect target — exchanges code and returns encoded token",
+		Tags:        []string{"auth"},
 	}, func(ctx context.Context, in *struct {
-		Code  string `query:"code" doc:"Authorization code from the provider."`
-		State string `query:"state" doc:"State token echoed back by the provider."`
-	}) (*struct{}, error) {
+		Code  string `query:"code"`
+		State string `query:"state"`
+	}) (*callbackOut, error) {
 		s.mu.Lock()
-		userID, ok := s.pending[in.State]
+		_, ok := s.pending[in.State]
 		if ok {
 			delete(s.pending, in.State)
 		}
@@ -142,31 +203,35 @@ func (s *Server) register() {
 		if err != nil {
 			return nil, huma.NewError(http.StatusBadGateway, fmt.Sprintf("token exchange failed: %v", err))
 		}
-		if err := s.cfg.Store.Save(ctx, userID, tok); err != nil {
-			return nil, huma.NewError(http.StatusInternalServerError, "failed to persist token")
+		enc, err := encodeToken(tok)
+		if err != nil {
+			return nil, huma.NewError(http.StatusInternalServerError, "failed to encode token")
 		}
-		return nil, nil
+		out := &callbackOut{}
+		out.Body.Token = enc
+		return out, nil
 	})
 
 	// ── Calendars ─────────────────────────────────────────────────────────────
 
 	type listCalendarsOut struct {
-		Body struct {
+		UpdatedToken string `header:"X-Calgate-Token" doc:"Present only when the token was refreshed mid-request. Store this value and use it for subsequent requests."`
+		Body         struct {
 			Calendars []calgate.Calendar `json:"calendars"`
 		}
 	}
 	huma.Register(s.api, huma.Operation{
 		OperationID: "list-calendars",
 		Method:      http.MethodGet,
-		Path:        "/users/{userID}/calendars",
-		Summary:     "List calendars for a user",
+		Path:        "/calendars",
+		Summary:     "List calendars for the authenticated account",
 		Tags:        []string{"calendars"},
 	}, func(ctx context.Context, in *struct {
-		UserID string `path:"userID"`
+		Token string `header:"X-Calgate-Token" required:"true"`
 	}) (*listCalendarsOut, error) {
-		gw, err := s.cfg.NewGateway(ctx, in.UserID)
+		gw, capture, err := s.buildGateway(ctx, in.Token)
 		if err != nil {
-			return nil, mapErr(err)
+			return nil, err
 		}
 		cals, err := gw.ListCalendars(ctx)
 		if err != nil {
@@ -174,35 +239,37 @@ func (s *Server) register() {
 		}
 		out := &listCalendarsOut{}
 		out.Body.Calendars = cals
+		out.UpdatedToken = capturedToken(capture)
 		return out, nil
 	})
 
 	// ── Events ────────────────────────────────────────────────────────────────
 
 	type listEventsOut struct {
-		Body struct {
+		UpdatedToken string `header:"X-Calgate-Token"`
+		Body         struct {
 			Events []calgate.Event `json:"events"`
 		}
 	}
 	huma.Register(s.api, huma.Operation{
 		OperationID: "list-events",
 		Method:      http.MethodGet,
-		Path:        "/users/{userID}/calendars/{calendarID}/events",
+		Path:        "/calendars/{calendarID}/events",
 		Summary:     "List events in a calendar",
 		Tags:        []string{"events"},
 	}, func(ctx context.Context, in *struct {
-		UserID     string `path:"userID"`
+		Token      string `header:"X-Calgate-Token" required:"true"`
 		CalendarID string `path:"calendarID"`
-		Start      string `query:"start" doc:"Inclusive window start in RFC 3339. Omit for unbounded."`
-		End        string `query:"end" doc:"Exclusive window end in RFC 3339. Omit for unbounded."`
+		Start      string `query:"start" doc:"Inclusive window start (RFC 3339). Omit for unbounded."`
+		End        string `query:"end" doc:"Exclusive window end (RFC 3339). Omit for unbounded."`
 	}) (*listEventsOut, error) {
 		tr, err := parseTimeRange(in.Start, in.End)
 		if err != nil {
 			return nil, huma.NewError(http.StatusUnprocessableEntity, err.Error())
 		}
-		gw, err := s.cfg.NewGateway(ctx, in.UserID)
+		gw, capture, err := s.buildGateway(ctx, in.Token)
 		if err != nil {
-			return nil, mapErr(err)
+			return nil, err
 		}
 		events, err := gw.ListEvents(ctx, in.CalendarID, tr)
 		if err != nil {
@@ -210,32 +277,36 @@ func (s *Server) register() {
 		}
 		out := &listEventsOut{}
 		out.Body.Events = events
+		out.UpdatedToken = capturedToken(capture)
 		return out, nil
 	})
 
 	type getEventOut struct {
-		Body calgate.Event
+		UpdatedToken string `header:"X-Calgate-Token"`
+		Body         calgate.Event
 	}
 	huma.Register(s.api, huma.Operation{
 		OperationID: "get-event",
 		Method:      http.MethodGet,
-		Path:        "/users/{userID}/calendars/{calendarID}/events/{eventID}",
+		Path:        "/calendars/{calendarID}/events/{eventID}",
 		Summary:     "Get a single calendar event",
 		Tags:        []string{"events"},
 	}, func(ctx context.Context, in *struct {
-		UserID     string `path:"userID"`
+		Token      string `header:"X-Calgate-Token" required:"true"`
 		CalendarID string `path:"calendarID"`
 		EventID    string `path:"eventID"`
 	}) (*getEventOut, error) {
-		gw, err := s.cfg.NewGateway(ctx, in.UserID)
+		gw, capture, err := s.buildGateway(ctx, in.Token)
 		if err != nil {
-			return nil, mapErr(err)
+			return nil, err
 		}
 		event, err := gw.GetEvent(ctx, in.CalendarID, in.EventID)
 		if err != nil {
 			return nil, mapErr(err)
 		}
-		return &getEventOut{Body: event}, nil
+		out := &getEventOut{Body: event}
+		out.UpdatedToken = capturedToken(capture)
+		return out, nil
 	})
 }
 
@@ -243,7 +314,7 @@ func (s *Server) register() {
 func mapErr(err error) error {
 	switch {
 	case errors.Is(err, calgate.ErrUnauthorized):
-		return huma.NewError(http.StatusUnauthorized, "not authorized; run POST /auth first")
+		return huma.NewError(http.StatusUnauthorized, "not authorized; run POST /auth")
 	case errors.Is(err, calgate.ErrNotFound):
 		return huma.NewError(http.StatusNotFound, "not found")
 	case errors.Is(err, calgate.ErrRateLimited):
@@ -272,6 +343,33 @@ func parseTimeRange(start, end string) (calgate.TimeRange, error) {
 		tr.End = t
 	}
 	return tr, nil
+}
+
+// encodeToken JSON-marshals tok and base64url-encodes the result.
+// The encoded form is safe for use as a header value and is treated as opaque
+// by callers — they store and return it verbatim.
+func encodeToken(tok *oauth2.Token) (string, error) {
+	b, err := json.Marshal(tok)
+	if err != nil {
+		return "", err
+	}
+	return base64.RawURLEncoding.EncodeToString(b), nil
+}
+
+// decodeToken reverses encodeToken.
+func decodeToken(s string) (*oauth2.Token, error) {
+	if s == "" {
+		return nil, fmt.Errorf("empty token")
+	}
+	b, err := base64.RawURLEncoding.DecodeString(s)
+	if err != nil {
+		return nil, fmt.Errorf("base64 decode: %w", err)
+	}
+	var tok oauth2.Token
+	if err := json.Unmarshal(b, &tok); err != nil {
+		return nil, fmt.Errorf("json unmarshal: %w", err)
+	}
+	return &tok, nil
 }
 
 func randomState() (string, error) {

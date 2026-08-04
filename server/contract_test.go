@@ -1,7 +1,11 @@
 // Package server_test contains black-box HTTP contract tests. Each test spins
 // up a real httptest.Server and exercises the API surface end-to-end through
 // actual HTTP requests, validating status codes, Content-Type, and response
-// body shapes.
+// body and header shapes.
+//
+// Tokens are caller-managed in this model: mustAuth drives the full auth flow
+// and returns the encoded token that subsequent test requests pass via the
+// X-Calgate-Token header.
 package server_test
 
 import (
@@ -12,7 +16,6 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"net/url"
-	"sync"
 	"testing"
 	"time"
 
@@ -35,29 +38,9 @@ func (a *cAuth) Exchange(_ context.Context, _ string) (*oauth2.Token, error) {
 	return a.tok, a.err
 }
 
-type cStore struct {
-	mu     sync.RWMutex
-	tokens map[string]*oauth2.Token
-}
+type staticTS struct{ tok *oauth2.Token }
 
-func newCStore() *cStore { return &cStore{tokens: map[string]*oauth2.Token{}} }
-
-func (s *cStore) Load(_ context.Context, userID string) (*oauth2.Token, error) {
-	s.mu.RLock()
-	defer s.mu.RUnlock()
-	t, ok := s.tokens[userID]
-	if !ok {
-		return nil, calgate.ErrUnauthorized
-	}
-	return t, nil
-}
-
-func (s *cStore) Save(_ context.Context, userID string, t *oauth2.Token) error {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	s.tokens[userID] = t
-	return nil
-}
+func (s *staticTS) Token() (*oauth2.Token, error) { return s.tok, nil }
 
 type cGW struct {
 	calendars []calgate.Calendar
@@ -76,13 +59,12 @@ func (g *cGW) GetEvent(_ context.Context, _, _ string) (calgate.Event, error) {
 	return g.event, g.err
 }
 
-// ── Test server helpers ───────────────────────────────────────────────────────
+// ── Test environment ──────────────────────────────────────────────────────────
 
 type testEnv struct {
-	ts    *httptest.Server
-	auth  *cAuth
-	store *cStore
-	gw    *cGW
+	ts   *httptest.Server
+	auth *cAuth
+	gw   *cGW
 }
 
 func newTestEnv(t *testing.T) *testEnv {
@@ -90,19 +72,17 @@ func newTestEnv(t *testing.T) *testEnv {
 	env := &testEnv{
 		auth: &cAuth{
 			baseURL: "https://mock.test/oauth",
-			tok:     &oauth2.Token{AccessToken: "tok", Expiry: time.Now().Add(time.Hour)},
+			tok:     &oauth2.Token{AccessToken: "tok", RefreshToken: "ref", Expiry: time.Now().Add(time.Hour)},
 		},
-		store: newCStore(),
-		gw:    &cGW{},
+		gw: &cGW{},
 	}
 	srv := server.New(server.Config{
 		Authenticator: env.auth,
-		Store:         env.store,
-		NewGateway: func(ctx context.Context, userID string) (calgate.Gateway, error) {
-			if _, err := env.store.Load(ctx, userID); err != nil {
-				return nil, err
-			}
-			return env.gw, nil
+		NewTokenSource: func(_ context.Context, tok *oauth2.Token) oauth2.TokenSource {
+			return &staticTS{tok}
+		},
+		NewGateway: func(_ context.Context, _ oauth2.TokenSource) calgate.Gateway {
+			return env.gw
 		},
 	})
 	env.ts = httptest.NewServer(srv.Handler())
@@ -110,13 +90,14 @@ func newTestEnv(t *testing.T) *testEnv {
 	return env
 }
 
-// mustAuth drives the full auth flow for userID via HTTP and fatals on any failure.
-func mustAuth(t *testing.T, baseURL, userID string) {
+// ── Helpers ───────────────────────────────────────────────────────────────────
+
+// mustAuth drives POST /auth → GET /auth/callback and returns the encoded
+// token string to use in X-Calgate-Token on subsequent requests.
+func mustAuth(t *testing.T, baseURL string) string {
 	t.Helper()
 
-	// Step 1: begin auth.
-	body, _ := json.Marshal(map[string]string{"user_id": userID})
-	resp, err := http.Post(baseURL+"/auth", "application/json", bytes.NewReader(body))
+	resp, err := http.Post(baseURL+"/auth", "application/json", bytes.NewReader([]byte("{}")))
 	if err != nil {
 		t.Fatalf("POST /auth: %v", err)
 	}
@@ -130,11 +111,10 @@ func mustAuth(t *testing.T, baseURL, userID string) {
 	}
 	if err := json.NewDecoder(resp.Body).Decode(&ar); err != nil {
 		resp.Body.Close()
-		t.Fatalf("decode auth response: %v", err)
+		t.Fatalf("decode POST /auth body: %v", err)
 	}
 	resp.Body.Close()
 
-	// Step 2: extract state from consent URL.
 	u, err := url.Parse(ar.AuthURL)
 	if err != nil {
 		t.Fatalf("parse auth_url %q: %v", ar.AuthURL, err)
@@ -144,41 +124,46 @@ func mustAuth(t *testing.T, baseURL, userID string) {
 		t.Fatalf("no state in auth_url %q", ar.AuthURL)
 	}
 
-	// Step 3: simulate provider redirect with code.
-	cbURL := baseURL + "/auth/callback?code=testcode&state=" + state
+	cbURL := baseURL + "/auth/callback?code=testcode&state=" + url.QueryEscape(state)
 	resp2, err := http.Get(cbURL)
 	if err != nil {
 		t.Fatalf("GET /auth/callback: %v", err)
 	}
-	defer resp2.Body.Close()
-	if resp2.StatusCode != http.StatusNoContent {
+	if resp2.StatusCode != http.StatusOK {
 		b, _ := io.ReadAll(resp2.Body)
+		resp2.Body.Close()
 		t.Fatalf("GET /auth/callback status = %d: %s", resp2.StatusCode, b)
 	}
+	var cr struct {
+		Token string `json:"token"`
+	}
+	if err := json.NewDecoder(resp2.Body).Decode(&cr); err != nil {
+		resp2.Body.Close()
+		t.Fatalf("decode /auth/callback body: %v", err)
+	}
+	resp2.Body.Close()
+	if cr.Token == "" {
+		t.Fatal("callback response has empty token")
+	}
+	return cr.Token
 }
 
-// get sends a GET and returns the response; caller is responsible for closing Body.
-func get(t *testing.T, rawURL string) *http.Response {
+func getWithToken(t *testing.T, rawURL, token string) *http.Response {
 	t.Helper()
-	resp, err := http.Get(rawURL)
+	req, err := http.NewRequest(http.MethodGet, rawURL, nil)
+	if err != nil {
+		t.Fatalf("new request: %v", err)
+	}
+	if token != "" {
+		req.Header.Set("X-Calgate-Token", token)
+	}
+	resp, err := http.DefaultClient.Do(req)
 	if err != nil {
 		t.Fatalf("GET %s: %v", rawURL, err)
 	}
 	return resp
 }
 
-// postJSON sends a POST with a JSON body and returns the response.
-func postJSON(t *testing.T, rawURL string, v any) *http.Response {
-	t.Helper()
-	b, _ := json.Marshal(v)
-	resp, err := http.Post(rawURL, "application/json", bytes.NewReader(b))
-	if err != nil {
-		t.Fatalf("POST %s: %v", rawURL, err)
-	}
-	return resp
-}
-
-// assertStatus fatals if resp.StatusCode != want.
 func assertStatus(t *testing.T, resp *http.Response, want int) {
 	t.Helper()
 	if resp.StatusCode != want {
@@ -188,7 +173,6 @@ func assertStatus(t *testing.T, resp *http.Response, want int) {
 	}
 }
 
-// decodeJSON decodes JSON from resp.Body into v and closes the body.
 func decodeJSON(t *testing.T, resp *http.Response, v any) {
 	t.Helper()
 	defer resp.Body.Close()
@@ -202,7 +186,10 @@ func decodeJSON(t *testing.T, resp *http.Response, v any) {
 func TestAuthBegin(t *testing.T) {
 	env := newTestEnv(t)
 
-	resp := postJSON(t, env.ts.URL+"/auth", map[string]string{"user_id": "alice"})
+	resp, err := http.Post(env.ts.URL+"/auth", "application/json", bytes.NewReader([]byte("{}")))
+	if err != nil {
+		t.Fatal(err)
+	}
 	assertStatus(t, resp, http.StatusOK)
 
 	var body struct {
@@ -215,36 +202,71 @@ func TestAuthBegin(t *testing.T) {
 	}
 	u, err := url.Parse(body.AuthURL)
 	if err != nil {
-		t.Fatalf("auth_url is not a valid URL: %v", err)
+		t.Fatalf("auth_url not a valid URL: %v", err)
 	}
 	if u.Query().Get("state") == "" {
 		t.Error("auth_url has no state param")
 	}
 }
 
-func TestAuthCallback_ValidState(t *testing.T) {
+func TestAuthCallback_FullFlow(t *testing.T) {
 	env := newTestEnv(t)
-	// mustAuth covers the full round-trip and fatals if anything goes wrong.
-	mustAuth(t, env.ts.URL, "alice")
+	tok := mustAuth(t, env.ts.URL)
+	if tok == "" {
+		t.Fatal("empty token from auth flow")
+	}
+}
+
+func TestAuthCallback_ReturnsToken(t *testing.T) {
+	env := newTestEnv(t)
+
+	resp, _ := http.Post(env.ts.URL+"/auth", "application/json", bytes.NewReader([]byte("{}")))
+	var ar struct{ AuthURL string `json:"auth_url"` }
+	json.NewDecoder(resp.Body).Decode(&ar)
+	resp.Body.Close()
+
+	u, _ := url.Parse(ar.AuthURL)
+	state := u.Query().Get("state")
+
+	resp2 := getWithToken(t, env.ts.URL+"/auth/callback?code=x&state="+url.QueryEscape(state), "")
+	assertStatus(t, resp2, http.StatusOK)
+
+	var cr struct{ Token string `json:"token"` }
+	decodeJSON(t, resp2, &cr)
+	if cr.Token == "" {
+		t.Error("callback response missing token field")
+	}
 }
 
 func TestAuthCallback_UnknownState(t *testing.T) {
 	env := newTestEnv(t)
-
-	resp := get(t, env.ts.URL+"/auth/callback?code=x&state=doesnotexist")
+	resp := getWithToken(t, env.ts.URL+"/auth/callback?code=x&state=doesnotexist", "")
 	defer resp.Body.Close()
 	assertStatus(t, resp, http.StatusBadRequest)
 }
 
-func TestAuthCallback_MissingParams(t *testing.T) {
+func TestAuthCallback_StateConsumedOnUse(t *testing.T) {
 	env := newTestEnv(t)
 
-	// No code or state at all — huma returns 422 for required query params.
-	resp := get(t, env.ts.URL+"/auth/callback")
-	defer resp.Body.Close()
-	if resp.StatusCode == http.StatusOK {
-		t.Fatal("expected non-200 for missing required params")
-	}
+	resp, _ := http.Post(env.ts.URL+"/auth", "application/json", bytes.NewReader([]byte("{}")))
+	var ar struct{ AuthURL string `json:"auth_url"` }
+	json.NewDecoder(resp.Body).Decode(&ar)
+	resp.Body.Close()
+
+	u, _ := url.Parse(ar.AuthURL)
+	state := u.Query().Get("state")
+	cbURL := env.ts.URL + "/auth/callback?code=x&state=" + url.QueryEscape(state)
+
+	// First use: should succeed.
+	r1 := getWithToken(t, cbURL, "")
+	assertStatus(t, r1, http.StatusOK)
+	io.ReadAll(r1.Body)
+	r1.Body.Close()
+
+	// Second use of same state: must fail.
+	r2 := getWithToken(t, cbURL, "")
+	defer r2.Body.Close()
+	assertStatus(t, r2, http.StatusBadRequest)
 }
 
 // ── Calendar tests ────────────────────────────────────────────────────────────
@@ -255,9 +277,9 @@ func TestListCalendars(t *testing.T) {
 		{ID: "cal-1", Name: "Personal", Provider: calgate.ProviderOutlook},
 		{ID: "cal-2", Name: "Work", Provider: calgate.ProviderOutlook},
 	}
-	mustAuth(t, env.ts.URL, "alice")
+	tok := mustAuth(t, env.ts.URL)
 
-	resp := get(t, env.ts.URL+"/users/alice/calendars")
+	resp := getWithToken(t, env.ts.URL+"/calendars", tok)
 	assertStatus(t, resp, http.StatusOK)
 
 	var body struct {
@@ -273,10 +295,19 @@ func TestListCalendars(t *testing.T) {
 	}
 }
 
-func TestListCalendars_Unauthorized(t *testing.T) {
+func TestListCalendars_MissingToken(t *testing.T) {
 	env := newTestEnv(t)
-	// "bob" never authorized — expect 401.
-	resp := get(t, env.ts.URL+"/users/bob/calendars")
+	resp := getWithToken(t, env.ts.URL+"/calendars", "")
+	defer resp.Body.Close()
+	// huma returns 400 for missing required header, or our 401 — either is correct
+	if resp.StatusCode == http.StatusOK {
+		t.Fatal("expected non-200 for missing token")
+	}
+}
+
+func TestListCalendars_InvalidToken(t *testing.T) {
+	env := newTestEnv(t)
+	resp := getWithToken(t, env.ts.URL+"/calendars", "this-is-not-a-valid-token")
 	defer resp.Body.Close()
 	assertStatus(t, resp, http.StatusUnauthorized)
 }
@@ -284,9 +315,9 @@ func TestListCalendars_Unauthorized(t *testing.T) {
 func TestListCalendars_ProviderError(t *testing.T) {
 	env := newTestEnv(t)
 	env.gw.err = calgate.ErrProvider
-	mustAuth(t, env.ts.URL, "alice")
+	tok := mustAuth(t, env.ts.URL)
 
-	resp := get(t, env.ts.URL+"/users/alice/calendars")
+	resp := getWithToken(t, env.ts.URL+"/calendars", tok)
 	defer resp.Body.Close()
 	assertStatus(t, resp, http.StatusBadGateway)
 }
@@ -298,9 +329,9 @@ func TestListEvents(t *testing.T) {
 	env.gw.events = []calgate.Event{
 		{ID: "ev-1", Title: "Standup", Provider: calgate.ProviderOutlook},
 	}
-	mustAuth(t, env.ts.URL, "alice")
+	tok := mustAuth(t, env.ts.URL)
 
-	resp := get(t, env.ts.URL+"/users/alice/calendars/cal-1/events")
+	resp := getWithToken(t, env.ts.URL+"/calendars/cal-1/events", tok)
 	assertStatus(t, resp, http.StatusOK)
 
 	var body struct {
@@ -319,13 +350,13 @@ func TestListEvents(t *testing.T) {
 func TestListEvents_WithTimeRange(t *testing.T) {
 	env := newTestEnv(t)
 	env.gw.events = []calgate.Event{{ID: "ev-1", Title: "Meeting"}}
-	mustAuth(t, env.ts.URL, "alice")
+	tok := mustAuth(t, env.ts.URL)
 
 	start := time.Now().UTC().Format(time.RFC3339)
 	end := time.Now().Add(24 * time.Hour).UTC().Format(time.RFC3339)
-	u := env.ts.URL + "/users/alice/calendars/cal-1/events?start=" + url.QueryEscape(start) + "&end=" + url.QueryEscape(end)
+	u := env.ts.URL + "/calendars/cal-1/events?start=" + url.QueryEscape(start) + "&end=" + url.QueryEscape(end)
 
-	resp := get(t, u)
+	resp := getWithToken(t, u, tok)
 	assertStatus(t, resp, http.StatusOK)
 
 	var body struct {
@@ -339,18 +370,16 @@ func TestListEvents_WithTimeRange(t *testing.T) {
 
 func TestListEvents_InvalidStart(t *testing.T) {
 	env := newTestEnv(t)
-	mustAuth(t, env.ts.URL, "alice")
-
-	resp := get(t, env.ts.URL+"/users/alice/calendars/cal-1/events?start=not-a-date")
+	tok := mustAuth(t, env.ts.URL)
+	resp := getWithToken(t, env.ts.URL+"/calendars/cal-1/events?start=not-a-date", tok)
 	defer resp.Body.Close()
 	assertStatus(t, resp, http.StatusUnprocessableEntity)
 }
 
 func TestListEvents_InvalidEnd(t *testing.T) {
 	env := newTestEnv(t)
-	mustAuth(t, env.ts.URL, "alice")
-
-	resp := get(t, env.ts.URL+"/users/alice/calendars/cal-1/events?end=garbage")
+	tok := mustAuth(t, env.ts.URL)
+	resp := getWithToken(t, env.ts.URL+"/calendars/cal-1/events?end=garbage", tok)
 	defer resp.Body.Close()
 	assertStatus(t, resp, http.StatusUnprocessableEntity)
 }
@@ -358,9 +387,9 @@ func TestListEvents_InvalidEnd(t *testing.T) {
 func TestGetEvent(t *testing.T) {
 	env := newTestEnv(t)
 	env.gw.event = calgate.Event{ID: "ev-1", Title: "Standup", Provider: calgate.ProviderOutlook}
-	mustAuth(t, env.ts.URL, "alice")
+	tok := mustAuth(t, env.ts.URL)
 
-	resp := get(t, env.ts.URL+"/users/alice/calendars/cal-1/events/ev-1")
+	resp := getWithToken(t, env.ts.URL+"/calendars/cal-1/events/ev-1", tok)
 	assertStatus(t, resp, http.StatusOK)
 
 	var body map[string]any
@@ -377,9 +406,8 @@ func TestGetEvent(t *testing.T) {
 func TestGetEvent_NotFound(t *testing.T) {
 	env := newTestEnv(t)
 	env.gw.err = calgate.ErrNotFound
-	mustAuth(t, env.ts.URL, "alice")
-
-	resp := get(t, env.ts.URL+"/users/alice/calendars/cal-1/events/missing")
+	tok := mustAuth(t, env.ts.URL)
+	resp := getWithToken(t, env.ts.URL+"/calendars/cal-1/events/missing", tok)
 	defer resp.Body.Close()
 	assertStatus(t, resp, http.StatusNotFound)
 }
@@ -387,40 +415,35 @@ func TestGetEvent_NotFound(t *testing.T) {
 func TestGetEvent_RateLimited(t *testing.T) {
 	env := newTestEnv(t)
 	env.gw.err = calgate.ErrRateLimited
-	mustAuth(t, env.ts.URL, "alice")
-
-	resp := get(t, env.ts.URL+"/users/alice/calendars/cal-1/events/ev-1")
+	tok := mustAuth(t, env.ts.URL)
+	resp := getWithToken(t, env.ts.URL+"/calendars/cal-1/events/ev-1", tok)
 	defer resp.Body.Close()
 	assertStatus(t, resp, http.StatusTooManyRequests)
 }
 
 // ── Response shape contract ───────────────────────────────────────────────────
 
-// TestResponseContentType verifies all JSON endpoints advertise application/json.
 func TestResponseContentType(t *testing.T) {
 	env := newTestEnv(t)
 	env.gw.calendars = []calgate.Calendar{{ID: "c1", Name: "Cal"}}
-	mustAuth(t, env.ts.URL, "alice")
+	tok := mustAuth(t, env.ts.URL)
 
-	endpoints := []string{
-		"/users/alice/calendars",
-	}
-	for _, ep := range endpoints {
-		resp := get(t, env.ts.URL+ep)
-		assertStatus(t, resp, http.StatusOK)
-		ct := resp.Header.Get("Content-Type")
-		resp.Body.Close()
-		if ct == "" {
-			t.Errorf("%s: missing Content-Type header", ep)
-		}
+	resp := getWithToken(t, env.ts.URL+"/calendars", tok)
+	assertStatus(t, resp, http.StatusOK)
+	ct := resp.Header.Get("Content-Type")
+	resp.Body.Close()
+	if ct == "" {
+		t.Error("missing Content-Type header")
 	}
 }
 
-// TestOpenAPISpec verifies huma serves the generated spec.
 func TestOpenAPISpec(t *testing.T) {
 	env := newTestEnv(t)
 
-	resp := get(t, env.ts.URL+"/openapi.json")
+	resp, err := http.Get(env.ts.URL + "/openapi.json")
+	if err != nil {
+		t.Fatal(err)
+	}
 	assertStatus(t, resp, http.StatusOK)
 
 	var spec map[string]any
@@ -436,9 +459,9 @@ func TestOpenAPISpec(t *testing.T) {
 	required := []string{
 		"/auth",
 		"/auth/callback",
-		"/users/{userID}/calendars",
-		"/users/{userID}/calendars/{calendarID}/events",
-		"/users/{userID}/calendars/{calendarID}/events/{eventID}",
+		"/calendars",
+		"/calendars/{calendarID}/events",
+		"/calendars/{calendarID}/events/{eventID}",
 	}
 	for _, p := range required {
 		if paths[p] == nil {

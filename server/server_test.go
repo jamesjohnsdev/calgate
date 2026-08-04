@@ -22,7 +22,7 @@ type mockAuth struct {
 	err     error
 }
 
-func (m *mockAuth) AuthURL(state string) string     { return m.baseURL + "?state=" + state }
+func (m *mockAuth) AuthURL(state string) string { return m.baseURL + "?state=" + state }
 func (m *mockAuth) Exchange(_ context.Context, _ string) (*oauth2.Token, error) {
 	return m.tok, m.err
 }
@@ -72,7 +72,7 @@ func (m *mockGW) GetEvent(_ context.Context, _, _ string) (calgate.Event, error)
 	return m.event, m.err
 }
 
-// statusCoder matches huma's StatusError interface without importing huma.
+// statusCoder matches huma's StatusError without importing huma.
 type statusCoder interface{ GetStatus() int }
 
 // ── mapErr ────────────────────────────────────────────────────────────────────
@@ -115,7 +115,7 @@ func TestParseTimeRange(t *testing.T) {
 		check   func(t *testing.T, tr calgate.TimeRange)
 	}{
 		{
-			name:  "both empty yields zero range",
+			name: "both empty yields zero range",
 			check: func(t *testing.T, tr calgate.TimeRange) {
 				if !tr.Start.IsZero() || !tr.End.IsZero() {
 					t.Error("expected zero TimeRange")
@@ -190,19 +190,108 @@ func TestRandomState(t *testing.T) {
 	if len(s) != 32 {
 		t.Errorf("len = %d, want 32 (16 bytes hex-encoded)", len(s))
 	}
-	const hexChars = "0123456789abcdef"
 	for _, c := range s {
-		if !strings.ContainsRune(hexChars, c) {
+		if !strings.ContainsRune("0123456789abcdef", c) {
 			t.Errorf("non-hex character %q in state", c)
 			break
 		}
 	}
-
 	s2, err := randomState()
 	if err != nil {
 		t.Fatal(err)
 	}
 	if s == s2 {
 		t.Error("two successive states must not collide")
+	}
+}
+
+// ── encodeToken / decodeToken ─────────────────────────────────────────────────
+
+func TestEncodeDecodeToken_RoundTrip(t *testing.T) {
+	want := &oauth2.Token{
+		AccessToken:  "acc",
+		RefreshToken: "ref",
+		TokenType:    "Bearer",
+		Expiry:       time.Now().UTC().Truncate(time.Second).Add(time.Hour),
+	}
+	enc, err := encodeToken(want)
+	if err != nil {
+		t.Fatalf("encodeToken: %v", err)
+	}
+	if enc == "" {
+		t.Fatal("encoded token is empty")
+	}
+	got, err := decodeToken(enc)
+	if err != nil {
+		t.Fatalf("decodeToken: %v", err)
+	}
+	if got.AccessToken != want.AccessToken {
+		t.Errorf("AccessToken = %q, want %q", got.AccessToken, want.AccessToken)
+	}
+	if got.RefreshToken != want.RefreshToken {
+		t.Errorf("RefreshToken = %q, want %q", got.RefreshToken, want.RefreshToken)
+	}
+	if !got.Expiry.Equal(want.Expiry) {
+		t.Errorf("Expiry = %v, want %v", got.Expiry, want.Expiry)
+	}
+}
+
+func TestDecodeToken_Invalid(t *testing.T) {
+	cases := []struct {
+		name string
+		in   string
+	}{
+		{"empty", ""},
+		{"not base64", "!!!"},
+		{"valid base64 not json", "aGVsbG8="}, // "hello"
+		{"truncated json", "ew"}, // base64url of "{" — incomplete JSON
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			_, err := decodeToken(tc.in)
+			if err == nil {
+				t.Error("expected error, got nil")
+			}
+		})
+	}
+}
+
+// ── tokenCapture ──────────────────────────────────────────────────────────────
+
+func TestTokenCapture_Save(t *testing.T) {
+	tc := &tokenCapture{}
+	tok := &oauth2.Token{AccessToken: "new"}
+	if err := tc.Save(context.Background(), "any", tok); err != nil {
+		t.Fatalf("Save: %v", err)
+	}
+	tc.mu.Lock()
+	got := tc.latest
+	tc.mu.Unlock()
+	if got != tok {
+		t.Error("latest not set after Save")
+	}
+}
+
+func TestTokenCapture_Load(t *testing.T) {
+	tc := &tokenCapture{}
+	_, err := tc.Load(context.Background(), "any")
+	if !errors.Is(err, calgate.ErrUnauthorized) {
+		t.Errorf("Load() error = %v, want ErrUnauthorized", err)
+	}
+}
+
+func TestCapturedToken_NilWhenNoRefresh(t *testing.T) {
+	tc := &tokenCapture{}
+	if s := capturedToken(tc); s != "" {
+		t.Errorf("capturedToken with no refresh = %q, want empty", s)
+	}
+}
+
+func TestCapturedToken_SetWhenRefreshed(t *testing.T) {
+	tc := &tokenCapture{}
+	tok := &oauth2.Token{AccessToken: "refreshed", RefreshToken: "newref"}
+	_ = tc.Save(context.Background(), "", tok)
+	if s := capturedToken(tc); s == "" {
+		t.Error("capturedToken should be non-empty after Save")
 	}
 }
