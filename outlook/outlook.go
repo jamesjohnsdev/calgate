@@ -114,7 +114,10 @@ func (g *gateway) get(ctx context.Context, path string, out any) error {
 	if err != nil {
 		return fmt.Errorf("%w: %v", calgate.ErrProvider, err)
 	}
-	defer resp.Body.Close()
+	defer func() {
+		_ = resp.Body.Close()
+		//TODO: log or handle this somehow
+	}()
 
 	if resp.StatusCode != http.StatusOK {
 		body, _ := io.ReadAll(io.LimitReader(resp.Body, 4096))
