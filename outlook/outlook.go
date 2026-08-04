@@ -12,6 +12,7 @@ import (
 	"io"
 	"net/http"
 	"net/url"
+	"strings"
 	"time"
 
 	"github.com/jamesjohnsdev/calgate"
@@ -85,7 +86,7 @@ func (c *Client) Exchange(ctx context.Context, code string) (*oauth2.Token, erro
 // yields valid access tokens. Pair with calgate.PersistingSource to keep the
 // stored refresh token fresh across refreshes.
 func (c *Client) Gateway(ctx context.Context, ts oauth2.TokenSource) calgate.Gateway {
-	return &gateway{http: oauth2.NewClient(ctx, ts)}
+	return &gateway{http: oauth2.NewClient(ctx, ts), base: graphBase}
 }
 
 // SourceFor loads a user's stored token and wraps it in an auto-refreshing,
@@ -101,10 +102,11 @@ func (c *Client) SourceFor(ctx context.Context, userID string, store calgate.Tok
 
 type gateway struct {
 	http *http.Client
+	base string // Graph base URL; overridable in tests
 }
 
 func (g *gateway) get(ctx context.Context, path string, out any) error {
-	req, err := http.NewRequestWithContext(ctx, http.MethodGet, graphBase+path, nil)
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, g.base+path, nil)
 	if err != nil {
 		return err
 	}
@@ -192,7 +194,8 @@ func (g *gateway) GetEvent(ctx context.Context, calendarID, eventID string) (cal
 	return e.toEvent(), nil
 }
 
-// relLink turns an absolute Graph @odata.nextLink into a path we can re-request.
+// relLink turns an absolute Graph @odata.nextLink into a path we can re-request
+// against the configured base (which already includes the /v1.0 prefix).
 func relLink(next string) string {
 	if next == "" {
 		return ""
@@ -201,8 +204,12 @@ func relLink(next string) string {
 	if err != nil {
 		return ""
 	}
-	if u.RawQuery != "" {
-		return u.Path[len("/v1.0"):] + "?" + u.RawQuery
+	path := strings.TrimPrefix(u.Path, "/v1.0")
+	if path == "" {
+		return ""
 	}
-	return u.Path[len("/v1.0"):]
+	if u.RawQuery != "" {
+		return path + "?" + u.RawQuery
+	}
+	return path
 }
