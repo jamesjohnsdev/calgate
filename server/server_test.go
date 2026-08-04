@@ -5,7 +5,6 @@ import (
 	"errors"
 	"fmt"
 	"strings"
-	"sync"
 	"testing"
 	"time"
 
@@ -13,64 +12,6 @@ import (
 
 	"github.com/jamesjohnsdev/calgate"
 )
-
-// ── Shared mocks ──────────────────────────────────────────────────────────────
-
-type mockAuth struct {
-	baseURL string
-	tok     *oauth2.Token
-	err     error
-}
-
-func (m *mockAuth) AuthURL(state string) string { return m.baseURL + "?state=" + state }
-func (m *mockAuth) Exchange(_ context.Context, _ string) (*oauth2.Token, error) {
-	return m.tok, m.err
-}
-
-type mockStore struct {
-	mu      sync.RWMutex
-	tokens  map[string]*oauth2.Token
-	saveErr error
-}
-
-func newMockStore() *mockStore { return &mockStore{tokens: map[string]*oauth2.Token{}} }
-
-func (m *mockStore) Load(_ context.Context, userID string) (*oauth2.Token, error) {
-	m.mu.RLock()
-	defer m.mu.RUnlock()
-	t, ok := m.tokens[userID]
-	if !ok {
-		return nil, calgate.ErrUnauthorized
-	}
-	return t, nil
-}
-
-func (m *mockStore) Save(_ context.Context, userID string, t *oauth2.Token) error {
-	if m.saveErr != nil {
-		return m.saveErr
-	}
-	m.mu.Lock()
-	defer m.mu.Unlock()
-	m.tokens[userID] = t
-	return nil
-}
-
-type mockGW struct {
-	calendars []calgate.Calendar
-	events    []calgate.Event
-	event     calgate.Event
-	err       error
-}
-
-func (m *mockGW) ListCalendars(_ context.Context) ([]calgate.Calendar, error) {
-	return m.calendars, m.err
-}
-func (m *mockGW) ListEvents(_ context.Context, _ string, _ calgate.TimeRange) ([]calgate.Event, error) {
-	return m.events, m.err
-}
-func (m *mockGW) GetEvent(_ context.Context, _, _ string) (calgate.Event, error) {
-	return m.event, m.err
-}
 
 // statusCoder matches huma's StatusError without importing huma.
 type statusCoder interface{ GetStatus() int }
