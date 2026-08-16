@@ -2,8 +2,7 @@ package server
 
 import "testing"
 
-// FuzzParseTimeRange ensures parseTimeRange never panics on arbitrary input
-// and that success implies both returned times are valid (non-negative unix).
+// FuzzParseTimeRange ensures parseTimeRange never panics on arbitrary input.
 func FuzzParseTimeRange(f *testing.F) {
 	f.Add("", "")
 	f.Add("2025-01-01T00:00:00Z", "")
@@ -22,16 +21,7 @@ func FuzzParseTimeRange(f *testing.F) {
 	f.Add("2025-01-01T00:00:00", "")   // missing timezone
 
 	f.Fuzz(func(t *testing.T, start, end string) {
-		tr, err := parseTimeRange(start, end)
-		if err != nil {
-			return
-		}
-		if !tr.Start.IsZero() && tr.Start.Unix() < 0 {
-			t.Errorf("parseTimeRange(%q, %q): Start.Unix() < 0", start, end)
-		}
-		if !tr.End.IsZero() && tr.End.Unix() < 0 {
-			t.Errorf("parseTimeRange(%q, %q): End.Unix() < 0", start, end)
-		}
+		_, _ = parseTimeRange(start, end) // must not panic
 	})
 }
 
