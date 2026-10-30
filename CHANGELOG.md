@@ -1,5 +1,17 @@
 # Changelog
 
+## [0.2.1](https://github.com/jamesjohnsdev/calgate/compare/v0.2.0...v0.2.1) (2026-10-30)
+
+
+### Features
+
+* dockerise ([4d496c8](https://github.com/jamesjohnsdev/calgate/commit/4d496c8d8f69e7edfd3e9eacfa013444a156050b))
+
+
+### Dependencies
+
+* bump go version ([421cc84](https://github.com/jamesjohnsdev/calgate/commit/421cc84015fdb428bd8f88819e06a7aae0253e13))
+
 ## [0.2.0](https://github.com/jamesjohnsdev/calgate/compare/v0.1.0...v0.2.0) (2026-08-04)
 
 
