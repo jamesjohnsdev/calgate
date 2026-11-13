@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.2.2](https://github.com/jamesjohnsdev/calgate/compare/v0.2.1...v0.2.2) (2026-11-13)
+
+
+### Bug Fixes
+
+* **docker:** update builder to golang:1.27-alpine to match go.mod ([6bf87da](https://github.com/jamesjohnsdev/calgate/commit/6bf87da32aca82a6d7c97d7c7cc7a2db652e29a9))
+
 ## [0.2.1](https://github.com/jamesjohnsdev/calgate/compare/v0.2.0...v0.2.1) (2026-10-30)
 
 
