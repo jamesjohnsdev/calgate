@@ -7,7 +7,8 @@
 //	CALGATE_REDIRECT_URL   OAuth redirect URL                       (required)
 //	CALGATE_TENANT         Azure AD tenant, default "common"        (outlook only)
 //	CALGATE_ADDR           Listen address, default ":8080"          (optional)
-//
+//	CALGATE_FRONTEND_REDIRECT_URL Browser redirect after OAuth callback, default "http://localhost:5174"
+
 // Tokens are caller-managed. POST /auth starts the flow; GET /auth/callback
 // returns an encoded token the caller stores. Send it as X-Calgate-Token on
 // every subsequent request. If the token is refreshed mid-request, the updated
@@ -43,8 +44,14 @@ func main() {
 	redirectURL := mustEnv("CALGATE_REDIRECT_URL")
 	addr := os.Getenv("CALGATE_ADDR")
 
+	frontendURL := os.Getenv("CALGATE_FRONTEND_REDIRECT_URL")
+	if frontendURL == "" {
+		frontendURL = "http://localhost:5174"
+	}
+
 	var cfg server.Config
 	cfg.Addr = addr
+	cfg.FrontendRedirectURL = frontendURL
 
 	switch provider {
 	case "google":

@@ -35,7 +35,7 @@ For persistent token storage (refresh token write-back), inject a `calgate.Token
 
 ## Use as an HTTP service
 
-Build and run `cmd/server`. Tokens are caller-managed: the service returns an encoded token on first auth; the caller sends it back as `X-Calgate-Token` on every request. If the token is refreshed mid-request, the updated token comes back in the same header.
+Build and run `cmd/server`. Tokens are caller-managed: on first auth the browser is redirected to `CALGATE_FRONTEND_REDIRECT_URL?provider=...&token=...&state=...` with the encoded token; the caller (web app) sends it back as `X-Calgate-Token` on every request. If the token is refreshed mid-request, the updated token comes back in the same header.
 
 ```sh
 CALGATE_PROVIDER=google \
@@ -51,7 +51,7 @@ go run ./cmd/server
 | Method | Path                                 | Description                                    |
 | ------ | ------------------------------------ | ---------------------------------------------- |
 | `POST` | `/auth`                              | Returns `{"auth_url": "..."}` to redirect user |
-| `GET`  | `/auth/callback?code=&state=`        | Exchanges code, returns `{"token": "..."}`     |
+| `GET`  | `/auth/callback?code=&state=`        | Exchanges code, then 302-redirects to the frontend callback URL carrying the token |
 | `GET`  | `/calendars`                         | List calendars                                 |
 | `GET`  | `/calendars/{id}/events?start=&end=` | List events (RFC3339 bounds, optional)         |
 | `GET`  | `/calendars/{id}/events/{eventID}`   | Get single event                               |
@@ -68,6 +68,7 @@ All calendar/event endpoints require `X-Calgate-Token` header.
 | `CALGATE_REDIRECT_URL`  | yes      |           |                       |
 | `CALGATE_TENANT`        | no       | `common`  | Outlook only          |
 | `CALGATE_ADDR`          | no       | `:8080`   |                       |
+| `CALGATE_FRONTEND_REDIRECT_URL` | no | `http://localhost:5174` | Browser redirect after successful OAuth callback |
 
 ## Core types
 

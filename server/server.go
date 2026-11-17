@@ -1,9 +1,10 @@
 // Package server wraps calgate as a lightweight stateless HTTP microservice
-// using chi and huma. Tokens are caller-managed: the auth callback returns an
-// encoded token that the caller stores and sends with every subsequent request
-// via the X-Calgate-Token header. If the provider refreshes the token during a
-// request, the updated token is echoed in the same response header so the
-// caller can update their stored copy.
+// using chi and huma. Tokens are caller-managed: the auth callback exchanges the
+// code and redirects the browser to the configured frontend URL carrying the
+// encoded token; the caller (web app) stores and sends it with every subsequent
+// request via the X-Calgate-Token header. If the provider refreshes the token
+// during a request, the updated token is echoed in the same response header so
+// the caller can update their stored copy.
 package server
 
 import (
@@ -15,6 +16,7 @@ import (
 	"errors"
 	"fmt"
 	"net/http"
+	"net/url"
 	"sync"
 	"time"
 
@@ -25,12 +27,19 @@ import (
 	"golang.org/x/oauth2"
 
 	"github.com/jamesjohnsdev/calgate"
+	"github.com/jamesjohnsdev/calgate/google"
+	"github.com/jamesjohnsdev/calgate/outlook"
 )
 
 // Config holds everything the server needs at construction time.
 type Config struct {
 	// Addr is the TCP address to listen on. Defaults to ":8080".
 	Addr string
+
+	// FrontendRedirectURL is where the browser is redirected after a successful
+	// OAuth callback exchange. The callback carries the encoded token as a query
+	// parameter so the caller (web app) can finish the connection flow.
+	FrontendRedirectURL string
 
 	Authenticator calgate.Authenticator
 
@@ -173,42 +182,49 @@ func (s *Server) register() {
 		return out, nil
 	})
 
-	type callbackOut struct {
-		Body struct {
-			Token string `json:"token" doc:"Base64-encoded OAuth token. Store and send as X-Calgate-Token on subsequent requests. Treat as opaque — refresh token is embedded."`
-		}
-	}
-	huma.Register(s.api, huma.Operation{
-		OperationID: "auth-callback",
-		Method:      http.MethodGet,
-		Path:        "/auth/callback",
-		Summary:     "OAuth redirect target — exchanges code and returns encoded token",
-		Tags:        []string{"auth"},
-	}, func(ctx context.Context, in *struct {
-		Code  string `query:"code"`
-		State string `query:"state"`
-	}) (*callbackOut, error) {
+	s.router.Get("/auth/callback", func(w http.ResponseWriter, r *http.Request) {
+		ctx := r.Context()
+		code := r.URL.Query().Get("code")
+		state := r.URL.Query().Get("state")
+
 		s.mu.Lock()
-		_, ok := s.pending[in.State]
+		_, ok := s.pending[state]
 		if ok {
-			delete(s.pending, in.State)
+			delete(s.pending, state)
 		}
 		s.mu.Unlock()
 
 		if !ok {
-			return nil, huma.NewError(http.StatusBadRequest, "unknown or expired state; restart the auth flow")
+			http.Error(w, "unknown or expired state; restart the auth flow", http.StatusBadRequest)
+			return
 		}
-		tok, err := s.cfg.Authenticator.Exchange(ctx, in.Code)
+
+		tok, err := s.cfg.Authenticator.Exchange(ctx, code)
 		if err != nil {
-			return nil, huma.NewError(http.StatusBadGateway, fmt.Sprintf("token exchange failed: %v", err))
+			http.Error(w, fmt.Sprintf("token exchange failed: %v", err), http.StatusBadGateway)
+			return
 		}
+
 		enc, err := encodeToken(tok)
 		if err != nil {
-			return nil, huma.NewError(http.StatusInternalServerError, "failed to encode token")
+			http.Error(w, "failed to encode token", http.StatusInternalServerError)
+			return
 		}
-		out := &callbackOut{}
-		out.Body.Token = enc
-		return out, nil
+
+		provider := "unknown"
+		switch s.cfg.Authenticator.(type) {
+		case *google.Client:
+			provider = "google"
+		case *outlook.Client:
+			provider = "outlook"
+		}
+
+		redirectURL := s.cfg.FrontendRedirectURL
+		if redirectURL == "" {
+			redirectURL = "http://localhost:5174"
+		}
+		redirect := fmt.Sprintf("%s?provider=%s&token=%s&state=%s", redirectURL, provider, url.QueryEscape(enc), state)
+		http.Redirect(w, r, redirect, http.StatusFound)
 	})
 
 	// ── Calendars ─────────────────────────────────────────────────────────────

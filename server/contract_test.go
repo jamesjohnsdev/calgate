@@ -125,27 +125,40 @@ func mustAuth(t *testing.T, baseURL string) string {
 	}
 
 	cbURL := baseURL + "/auth/callback?code=testcode&state=" + url.QueryEscape(state)
-	resp2, err := http.Get(cbURL)
+	req, err := http.NewRequest(http.MethodGet, cbURL, nil)
+	if err != nil {
+		t.Fatalf("build GET /auth/callback: %v", err)
+	}
+	resp2, err := noRedirectClient().Do(req)
 	if err != nil {
 		t.Fatalf("GET /auth/callback: %v", err)
 	}
-	if resp2.StatusCode != http.StatusOK {
+	defer func() { _ = resp2.Body.Close() }()
+	if resp2.StatusCode != http.StatusFound {
 		b, _ := io.ReadAll(resp2.Body)
-		_ = resp2.Body.Close()
 		t.Fatalf("GET /auth/callback status = %d: %s", resp2.StatusCode, b)
 	}
-	var cr struct {
-		Token string `json:"token"`
+	loc := resp2.Header.Get("Location")
+	if loc == "" {
+		t.Fatal("callback response missing Location header")
 	}
-	if err := json.NewDecoder(resp2.Body).Decode(&cr); err != nil {
-		_ = resp2.Body.Close()
-		t.Fatalf("decode /auth/callback body: %v", err)
+	locURL, err := url.Parse(loc)
+	if err != nil {
+		t.Fatalf("parse callback Location %q: %v", loc, err)
 	}
-	_ = resp2.Body.Close()
-	if cr.Token == "" {
-		t.Fatal("callback response has empty token")
+	token := locURL.Query().Get("token")
+	if token == "" {
+		t.Fatal("callback redirect missing token param")
 	}
-	return cr.Token
+	return token
+}
+
+// noRedirectClient returns a client that does not follow redirects, so tests can
+// assert on the Location the callback responds with.
+func noRedirectClient() *http.Client {
+	return &http.Client{CheckRedirect: func(*http.Request, []*http.Request) error {
+		return http.ErrUseLastResponse
+	}}
 }
 
 func getWithToken(t *testing.T, rawURL, token string) *http.Response {
@@ -227,13 +240,23 @@ func TestAuthCallback_ReturnsToken(t *testing.T) {
 	u, _ := url.Parse(ar.AuthURL)
 	state := u.Query().Get("state")
 
-	resp2 := getWithToken(t, env.ts.URL+"/auth/callback?code=x&state="+url.QueryEscape(state), "")
-	assertStatus(t, resp2, http.StatusOK)
+	req, err := http.NewRequest(http.MethodGet, env.ts.URL+"/auth/callback?code=x&state="+url.QueryEscape(state), nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	resp2, err := noRedirectClient().Do(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = resp2.Body.Close() }()
+	assertStatus(t, resp2, http.StatusFound)
 
-	var cr struct{ Token string `json:"token"` }
-	decodeJSON(t, resp2, &cr)
-	if cr.Token == "" {
-		t.Error("callback response missing token field")
+	loc, err := url.Parse(resp2.Header.Get("Location"))
+	if err != nil {
+		t.Fatalf("parse callback Location: %v", err)
+	}
+	if token := loc.Query().Get("token"); token == "" {
+		t.Error("callback redirect missing token")
 	}
 }
 
@@ -255,14 +278,27 @@ func TestAuthCallback_StateConsumedOnUse(t *testing.T) {
 	state := u.Query().Get("state")
 	cbURL := env.ts.URL + "/auth/callback?code=x&state=" + url.QueryEscape(state)
 
-	// First use: should succeed.
-	r1 := getWithToken(t, cbURL, "")
-	assertStatus(t, r1, http.StatusOK)
-	_, _ = io.Copy(io.Discard, r1.Body)
-	_ = r1.Body.Close()
+	// First use: should succeed (302 redirect carrying the token).
+	req1, err := http.NewRequest(http.MethodGet, cbURL, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	r1, err := noRedirectClient().Do(req1)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = r1.Body.Close() }()
+	assertStatus(t, r1, http.StatusFound)
 
 	// Second use of same state: must fail.
-	r2 := getWithToken(t, cbURL, "")
+	req2, err := http.NewRequest(http.MethodGet, cbURL, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	r2, err := noRedirectClient().Do(req2)
+	if err != nil {
+		t.Fatal(err)
+	}
 	defer func() { _ = r2.Body.Close() }()
 	assertStatus(t, r2, http.StatusBadRequest)
 }
@@ -456,7 +492,6 @@ func TestOpenAPISpec(t *testing.T) {
 	}
 	required := []string{
 		"/auth",
-		"/auth/callback",
 		"/calendars",
 		"/calendars/{calendarID}/events",
 		"/calendars/{calendarID}/events/{eventID}",
