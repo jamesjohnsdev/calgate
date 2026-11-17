@@ -224,7 +224,8 @@ func (s *Server) register() {
 			redirectURL = "http://localhost:5174"
 		}
 		redirect := fmt.Sprintf("%s?provider=%s&token=%s&state=%s", redirectURL, provider, url.QueryEscape(enc), state)
-		http.Redirect(w, r, redirect, http.StatusFound)
+		w.Header().Set("Location", redirect)
+		w.WriteHeader(http.StatusFound)
 	})
 
 	// ── Calendars ─────────────────────────────────────────────────────────────
