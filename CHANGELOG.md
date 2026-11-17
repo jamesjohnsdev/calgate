@@ -1,5 +1,14 @@
 # Changelog
 
+## [0.2.2](https://github.com/jamesjohnsdev/calgate/compare/v0.2.1...v0.2.2) (2026-11-17)
+
+
+### Bug Fixes
+
+* avoid flagged http.Redirect target and bump Go to 1.27.4 ([b55b51f](https://github.com/jamesjohnsdev/calgate/commit/b55b51fc1b24707d2b9839e0d1dc3986867a2f8e))
+* correctly redirect on successful authentication ([9180cdc](https://github.com/jamesjohnsdev/calgate/commit/9180cdc9d3b8d43eea6fd83bb6ae52953a76d130))
+* **docker:** update builder to golang:1.27-alpine to match go.mod ([6bf87da](https://github.com/jamesjohnsdev/calgate/commit/6bf87da32aca82a6d7c97d7c7cc7a2db652e29a9))
+
 ## [0.2.1](https://github.com/jamesjohnsdev/calgate/compare/v0.2.0...v0.2.1) (2026-10-30)
 
 
