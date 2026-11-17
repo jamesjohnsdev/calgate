@@ -16,6 +16,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"net/url"
+	"strings"
 	"testing"
 	"time"
 
@@ -142,13 +143,27 @@ func mustAuth(t *testing.T, baseURL string) string {
 	if loc == "" {
 		t.Fatal("callback response missing Location header")
 	}
-	locURL, err := url.Parse(loc)
+	token := callbackToken(t, loc)
+	if token == "" {
+		t.Fatal("callback redirect missing token param")
+	}
+	return token
+}
+
+// callbackToken extracts the token from a callback Location value. The redirect
+// target is a frontend route carried in the URL fragment (e.g. /#/auth/callback?token=...).
+func callbackToken(t *testing.T, loc string) string {
+	t.Helper()
+	u, err := url.Parse(loc)
 	if err != nil {
 		t.Fatalf("parse callback Location %q: %v", loc, err)
 	}
-	token := locURL.Query().Get("token")
-	if token == "" {
-		t.Fatal("callback redirect missing token param")
+	token := ""
+	query := u.Fragment
+	if idx := strings.Index(query, "?"); idx >= 0 {
+		if vals, err := url.ParseQuery(query[idx+1:]); err == nil {
+			token = vals.Get("token")
+		}
 	}
 	return token
 }
@@ -251,11 +266,7 @@ func TestAuthCallback_ReturnsToken(t *testing.T) {
 	defer func() { _ = resp2.Body.Close() }()
 	assertStatus(t, resp2, http.StatusFound)
 
-	loc, err := url.Parse(resp2.Header.Get("Location"))
-	if err != nil {
-		t.Fatalf("parse callback Location: %v", err)
-	}
-	if token := loc.Query().Get("token"); token == "" {
+	if token := callbackToken(t, resp2.Header.Get("Location")); token == "" {
 		t.Error("callback redirect missing token")
 	}
 }

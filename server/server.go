@@ -223,7 +223,7 @@ func (s *Server) register() {
 		if redirectURL == "" {
 			redirectURL = "http://localhost:5174"
 		}
-		redirect := fmt.Sprintf("%s?provider=%s&token=%s&state=%s", redirectURL, provider, url.QueryEscape(enc), state)
+		redirect := fmt.Sprintf("%s#/auth/callback?provider=%s&token=%s&state=%s", redirectURL, provider, url.QueryEscape(enc), state)
 		w.Header().Set("Location", redirect)
 		w.WriteHeader(http.StatusFound)
 	})
